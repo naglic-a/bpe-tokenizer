@@ -1,1 +1,9 @@
+# Rust build files
 /target
+
+# Python cache files
+__pycache__/
+*.py[cod]
+
+# Local Python environment
+.venv/

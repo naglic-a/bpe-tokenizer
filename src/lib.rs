@@ -1,5 +1,4 @@
+mod bindings;
 mod tokenizer;
 
-pub use tokenizer::{Tokenizer, DecodeError};
-
-//TODO python bindings
+pub use tokenizer::{DecodeError, Tokenizer};
