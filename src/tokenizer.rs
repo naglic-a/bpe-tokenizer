@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{Error, ErrorKind};
+use rayon::prelude::*;
 
 const FILE_VERSION: u32 = 1;
 
@@ -88,15 +89,24 @@ impl Tokenizer {
             .collect();
 
         while tokenizer.vocab_size() < target_vocab_size {
-            let mut counts = HashMap::new();
-
-            for sequence in &sequences {
-                let sequence_counts = Self::count_pair_frequencies(sequence);
-
-                for (pair, count) in sequence_counts {
-                    *counts.entry(pair).or_insert(0) += count;
+            // Parallel counting: each thread counts its chunk, then we merge the HashMaps
+            let counts = sequences.par_iter().fold(
+                HashMap::new,
+                |mut acc: HashMap<(u32, u32), usize>, seq| {
+                    for pair in seq.windows(2) {
+                        *acc.entry((pair[0], pair[1])).or_insert(0) += 1;
+                    }
+                    acc
                 }
-            }
+            ).reduce(
+                HashMap::new,
+                |mut acc1, acc2| {
+                    for (k, v) in acc2 {
+                        *acc1.entry(k).or_insert(0) += v;
+                    }
+                    acc1
+                }
+            );
 
             let Some((left, right)) = Self::find_most_frequent_pair(&counts) else {
                 break;
@@ -104,10 +114,17 @@ impl Tokenizer {
 
             let merged_id = tokenizer.insert_merged_token(left, right);
 
-            for sequence in &mut sequences {
-                *sequence = Self::replace_pair_in_seq(sequence, left, right, merged_id);
+            // Parallel replace: replace the pair in all sequences simultaneously
+            sequences.par_iter_mut().for_each(|sequence| {
+                Self::replace_pair_in_seq(sequence, left, right, merged_id);
+            });
+
+            if tokenizer.vocab_size() % 100 == 0 || tokenizer.vocab_size() == target_vocab_size {
+                println!("Vocab size: {} / {}", tokenizer.vocab_size(), target_vocab_size);
             }
         }
+        
+        println!("Tokenizer training complete!");
         tokenizer
     }
 
@@ -143,7 +160,7 @@ impl Tokenizer {
 
             let merged_id = best_merged_id.expect("merge rank has no merge ID");
 
-            ids = Self::replace_pair_in_seq(&ids, left, right, merged_id);
+            Self::replace_pair_in_seq(&mut ids, left, right, merged_id);
         }
         ids
     }
@@ -187,6 +204,7 @@ impl Tokenizer {
 
     // Input: [a, b, a, b] produces counts {(a,b): 2, (b,a): 1}.
     // Output: a map from (left_id, right_id) to occurrence count.
+     #[allow(dead_code)]
     fn count_pair_frequencies(seq: &[u32]) -> HashMap<(u32, u32), usize> {
         let mut num_of_occur: HashMap<(u32, u32), usize> = HashMap::new();
         for j in seq.windows(2) {
@@ -243,29 +261,30 @@ impl Tokenizer {
         merged_id
     }
 
-    // Input: [x, left, right, left, right, y].
-    // Output: [x, merged_id, merged_id, y].
-    fn replace_pair_in_seq(seq: &[u32], left: u32, right: u32, merged_id: u32) -> Vec<u32> {
-        let mut result: Vec<u32> = Vec::with_capacity(seq.len());
+    // In-place replacement using Two-Pointer Array Mutation
+    // [A, B] = Z 
+    // 1. [A, B, A, B] write_idx = 0, i = 1
+    // 2. [Z, B, A, B] Write_ix++, i = 3
+    // 3. [Z, Z, A, B] write_idx = 1, i = 3, cant go more
+    // 4. [Z, Z]
+    fn replace_pair_in_seq(seq: &mut Vec<u32>, left: u32, right: u32, merged_id: u32) {
         if seq.is_empty() {
-            return result;
+            return;
         }
 
         let mut i = 0;
-        loop {
+        let mut write_idx = 0;
+        while i < seq.len() {
             if i + 1 < seq.len() && seq[i] == left && seq[i + 1] == right {
-                result.push(merged_id);
+                seq[write_idx] = merged_id;
                 i += 2;
             } else {
-                result.push(seq[i]);
+                seq[write_idx] = seq[i];
                 i += 1;
             }
-
-            if i >= seq.len() {
-                break;
-            }
+            write_idx += 1;
         }
-        result
+        seq.truncate(write_idx);
     }
 
     // Persistence
@@ -575,37 +594,63 @@ mod tests {
 
     #[test]
     fn replaces_pair_at_beginning() {
-        let result = Tokenizer::replace_pair_in_seq(&[10, 20, 30], 10, 20, 100);
+        let mut vec = vec![10, 20, 30];
+        Tokenizer::replace_pair_in_seq(&mut vec, 10, 20, 100);
 
-        assert_eq!(result, vec![100, 30]);
+        assert_eq!(vec, vec![100, 30]);
     }
 
     #[test]
     fn replaces_pair_in_middle() {
-        let result = Tokenizer::replace_pair_in_seq(&[10, 20, 30, 40], 20, 30, 100);
+        let mut vec = vec![10, 20, 30, 40];
+        let result = Tokenizer::replace_pair_in_seq(&mut vec, 20, 30, 100);
 
-        assert_eq!(result, vec![10, 100, 40]);
+        assert_eq!(vec, vec![10, 100, 40]);
     }
 
     #[test]
     fn replaces_pair_at_end() {
-        let result = Tokenizer::replace_pair_in_seq(&[10, 20, 30], 20, 30, 100);
+        let mut vec = vec![10, 20, 30];
+        let result = Tokenizer::replace_pair_in_seq(&mut vec, 20, 30, 100);
 
-        assert_eq!(result, vec![10, 100]);
+        assert_eq!(vec, vec![10, 100]);
     }
 
     #[test]
     fn keeps_sequence_when_pair_does_not_match() {
-        let result = Tokenizer::replace_pair_in_seq(&[10, 20, 30], 40, 50, 100);
+        let mut vec = vec![10, 20, 30];
+        let result = Tokenizer::replace_pair_in_seq(&mut vec, 40, 50, 100);
 
-        assert_eq!(result, vec![10, 20, 30]);
+        assert_eq!(vec, vec![10, 20, 30]);
     }
 
     #[test]
     fn replaces_overlapping_pair_from_left_to_right() {
-        let result = Tokenizer::replace_pair_in_seq(&[10, 10, 10], 10, 10, 100);
+        let mut vec = vec![10, 10, 10];
+        let result = Tokenizer::replace_pair_in_seq(&mut vec, 10, 10, 100);
 
-        assert_eq!(result, vec![100, 10]);
+        assert_eq!(vec, vec![100, 10]);
+    }
+
+    #[test]
+    fn replaces_multiple_sequential_pairs() {
+        let mut vec = vec![10, 20, 10, 20];
+        Tokenizer::replace_pair_in_seq(&mut vec, 10, 20, 100);
+        assert_eq!(vec, vec![100, 100]);
+    }
+
+    #[test]
+    fn handles_sequence_of_length_one() {
+        let mut vec = vec![10];
+        Tokenizer::replace_pair_in_seq(&mut vec, 10, 20, 100);
+        assert_eq!(vec, vec![10]);
+    }
+
+    #[test]
+    fn handles_empty_sequence() {
+        let mut vec: Vec<u32> = vec![];
+        Tokenizer::replace_pair_in_seq(&mut vec, 10, 20, 100);
+        assert_eq!(vec, vec![]);
     }
 
     #[test]
