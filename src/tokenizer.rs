@@ -130,39 +130,47 @@ impl Tokenizer {
 
     // Input: UTF-8 text.
     // Output: token IDs representing the same bytes.
-    // Example: an untrained tokenizer encodes "ABC" as [65, 66, 67].
-    // Algorithm: find the adjacent pair with the smallest merge rank, replace
-    // all non-overlapping occurrences, and repeat until no pair is mergeable.
     pub fn encode(&self, text: &str) -> Vec<u32> {
-        let b = text.as_bytes();
-        let mut ids: Vec<u32> = b.iter().map(|&byte| byte as u32).collect();
+        let lines: Vec<&str> = text.split('\n').collect();
+        
+        let encoded_lines: Vec<Vec<u32>> = lines.par_iter().map(|line| {
+            let b = line.as_bytes();
+            let mut ids: Vec<u32> = b.iter().map(|&byte| byte as u32).collect();
 
-        loop {
-            let mut best_pair = None;
-            let mut best_rank = usize::MAX;
-            let mut best_merged_id = None;
+            loop {
+                let mut best_pair = None;
+                let mut best_rank = usize::MAX;
+                let mut best_merged_id = None;
 
-            for pair in ids.windows(2) {
-                let pair = (pair[0], pair[1]);
-
-                if let Some(&rank) = self.ranks.get(&pair)
-                    && rank < best_rank
-                {
-                    best_pair = Some(pair);
-                    best_rank = rank;
-                    best_merged_id = self.merges.get(&pair).copied();
+                for pair in ids.windows(2) {
+                    let p = (pair[0], pair[1]);
+                    if let Some(&rank) = self.ranks.get(&p) {
+                        if rank < best_rank {
+                            best_pair = Some(p);
+                            best_rank = rank;
+                            best_merged_id = Some(self.merges[&p]);
+                        }
+                    }
                 }
+
+                let Some((left, right)) = best_pair else {
+                    break;
+                };
+
+                let merged_id = best_merged_id.expect("merge rank has no merge ID");
+                Self::replace_pair_in_seq(&mut ids, left, right, merged_id);
             }
+            ids
+        }).collect();
 
-            let Some((left, right)) = best_pair else {
-                break;
-            };
-
-            let merged_id = best_merged_id.expect("merge rank has no merge ID");
-
-            Self::replace_pair_in_seq(&mut ids, left, right, merged_id);
+        let mut final_ids = Vec::with_capacity(text.len() / 2);
+        for (i, mut line_ids) in encoded_lines.into_iter().enumerate() {
+            final_ids.append(&mut line_ids);
+            if i < lines.len() - 1 {
+                final_ids.push(10); // ASCII newline byte
+            }
         }
-        ids
+        final_ids
     }
 
     // Input: token IDs produced by encode.
