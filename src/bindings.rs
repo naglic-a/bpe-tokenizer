@@ -17,9 +17,9 @@ impl PyTokenizer {
     }
 
     #[staticmethod]
-    fn train(texts: Vec<String>, target_vocab_size: usize) -> Self {
+    fn train(text: &str, target_vocab_size: usize) -> Self {
         Self {
-            tokenizer: Tokenizer::train(texts, target_vocab_size),
+            tokenizer: Tokenizer::train(text, target_vocab_size),
         }
     }
 

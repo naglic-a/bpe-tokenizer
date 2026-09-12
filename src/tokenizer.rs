@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::fs;
 use std::io::{Error, ErrorKind};
 use rayon::prelude::*;
@@ -30,16 +30,16 @@ pub enum DecodeError {
 #[derive(Clone, Debug)]
 pub struct Tokenizer {
     pub vocab: Vec<Vec<u8>>,
-    pub token_to_id: HashMap<Vec<u8>, u32>,
-    pub merges: HashMap<(u32, u32), u32>,
-    pub ranks: HashMap<(u32, u32), usize>,
+    pub token_to_id: FxHashMap<Vec<u8>, u32>,
+    pub merges: FxHashMap<(u32, u32), u32>,
+    pub ranks: FxHashMap<(u32, u32), usize>,
 }
 
 impl Tokenizer {
     pub fn new() -> Self {
         let (vocab, token_to_id) = Self::build_initial_vocab();
-        let merges = HashMap::new();
-        let ranks = HashMap::new();
+        let merges = FxHashMap::default();
+        let ranks = FxHashMap::default();
         Self {
             vocab,
             token_to_id,
@@ -50,9 +50,9 @@ impl Tokenizer {
 
     pub fn from_parts(
         vocab: Vec<Vec<u8>>,
-        token_to_id: HashMap<Vec<u8>, u32>,
-        merges: HashMap<(u32, u32), u32>,
-        ranks: HashMap<(u32, u32), usize>,
+        token_to_id: FxHashMap<Vec<u8>, u32>,
+        merges: FxHashMap<(u32, u32), u32>,
+        ranks: FxHashMap<(u32, u32), usize>,
     ) -> Self {
         Self {
             vocab,
@@ -70,36 +70,44 @@ impl Tokenizer {
     //   - Do not create pairs across separate input texts.
     //   - Stop if there are no adjacent pairs left.
     //   - A target below 256 still requires the complete byte vocabulary.
-    pub fn train<I, S>(texts: I, target_vocab_size: usize) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<str>,
-    {
+    pub fn train(text: &str, target_vocab_size: usize) -> Self {
         let mut tokenizer = Self::new();
 
-        let mut sequences: Vec<Vec<u32>> = texts
-            .into_iter()
-            .map(|text| {
-                text.as_ref()
-                    .as_bytes()
-                    .iter()
-                    .map(|&byte| byte as u32)
-                    .collect()
+        let lines: Vec<&str> = text.split('\n').collect();
+        let num_lines = lines.len();
+        
+        let chunk_size = (num_lines / 16).max(1);
+
+        println!("Rayon threads available: {}", rayon::current_num_threads());
+
+        let mut sequences: Vec<Vec<u32>> = lines
+            .chunks(chunk_size)
+            .map(|chunk| {
+                let mut ids = Vec::with_capacity(chunk.iter().map(|c| c.len() + 1).sum());
+                for &line in chunk {
+                    ids.extend(line.as_bytes().iter().map(|&byte| byte as u32));
+                    ids.push(10); // ASCII for '\n'
+                }
+                ids
             })
             .collect();
+        
+        if let Some(last) = sequences.last_mut() {
+            last.pop();
+        }
 
         while tokenizer.vocab_size() < target_vocab_size {
-            // Parallel counting: each thread counts its chunk, then we merge the HashMaps
-            let counts = sequences.par_iter().fold(
-                HashMap::new,
-                |mut acc: HashMap<(u32, u32), usize>, seq| {
+            // Parallel counting: each thread counts its chunk, then we merge the FxHashMaps
+            let counts = sequences.par_iter().with_max_len(1).fold(
+                FxHashMap::default,
+                |mut acc: FxHashMap<(u32, u32), usize>, seq| {
                     for pair in seq.windows(2) {
                         *acc.entry((pair[0], pair[1])).or_insert(0) += 1;
                     }
                     acc
                 }
             ).reduce(
-                HashMap::new,
+                FxHashMap::default,
                 |mut acc1, acc2| {
                     for (k, v) in acc2 {
                         *acc1.entry(k).or_insert(0) += v;
@@ -115,7 +123,7 @@ impl Tokenizer {
             let merged_id = tokenizer.insert_merged_token(left, right);
 
             // Parallel replace: replace the pair in all sequences simultaneously
-            sequences.par_iter_mut().for_each(|sequence| {
+            sequences.par_iter_mut().with_max_len(1).for_each(|sequence| {
                 Self::replace_pair_in_seq(sequence, left, right, merged_id);
             });
 
@@ -197,13 +205,13 @@ impl Tokenizer {
 
     // --- Helper methods (private) ---
 
-    fn build_initial_vocab() -> (Vec<Vec<u8>>, HashMap<Vec<u8>, u32>) {
+    fn build_initial_vocab() -> (Vec<Vec<u8>>, FxHashMap<Vec<u8>, u32>) {
         let mut vocab: Vec<Vec<u8>> = Vec::with_capacity(1024);
         for i in 0..=255 {
             vocab.push(vec![i as u8]);
         }
 
-        let mut token_to_id: HashMap<Vec<u8>, u32> = HashMap::with_capacity(vocab.len());
+        let mut token_to_id: FxHashMap<Vec<u8>, u32> = FxHashMap::default();
         for (i, token) in vocab.iter().enumerate() {
             token_to_id.insert(token.clone(), i as u32);
         }
@@ -213,8 +221,8 @@ impl Tokenizer {
     // Input: [a, b, a, b] produces counts {(a,b): 2, (b,a): 1}.
     // Output: a map from (left_id, right_id) to occurrence count.
      #[allow(dead_code)]
-    fn count_pair_frequencies(seq: &[u32]) -> HashMap<(u32, u32), usize> {
-        let mut num_of_occur: HashMap<(u32, u32), usize> = HashMap::new();
+    fn count_pair_frequencies(seq: &[u32]) -> FxHashMap<(u32, u32), usize> {
+        let mut num_of_occur: FxHashMap<(u32, u32), usize> = FxHashMap::default();
         for j in seq.windows(2) {
             let pair = (j[0], j[1]);
             *num_of_occur.entry(pair).or_insert(0) += 1;
@@ -224,7 +232,7 @@ impl Tokenizer {
 
     // Input: pair-frequency map.
     // Output: Some(pair) for a non-empty map, otherwise None.
-    fn find_most_frequent_pair(counts: &HashMap<(u32, u32), usize>) -> Option<(u32, u32)> {
+    fn find_most_frequent_pair(counts: &FxHashMap<(u32, u32), usize>) -> Option<(u32, u32)> {
         if counts.is_empty() {
             return None;
         }
@@ -338,7 +346,7 @@ impl Tokenizer {
             ));
         }
 
-        let mut token_to_id = HashMap::with_capacity(saved_tokenizer.vocab.len());
+        let mut token_to_id = FxHashMap::default();
 
         for (id, token) in saved_tokenizer.vocab.iter().enumerate() {
             let id = u32::try_from(id)
@@ -352,8 +360,8 @@ impl Tokenizer {
             }
         }
 
-        let mut merges = HashMap::with_capacity(saved_tokenizer.merges.len());
-        let mut ranks = HashMap::with_capacity(saved_tokenizer.merges.len());
+        let mut merges = FxHashMap::default();
+        let mut ranks = FxHashMap::default();
 
         for merge in saved_tokenizer.merges {
             let pair = (merge.left, merge.right);
@@ -525,9 +533,9 @@ mod tests {
     fn decode_rejects_invalid_utf8() {
         let tokenizer = Tokenizer::from_parts(
             vec![vec![0xff, 0xfe, 0xc0, 0xaf]],
-            HashMap::new(),
-            HashMap::new(),
-            HashMap::new(),
+            FxHashMap::default(),
+            FxHashMap::default(),
+            FxHashMap::default(),
         );
 
         let result = tokenizer.decode(&[0]);
@@ -569,7 +577,7 @@ mod tests {
 
     #[test]
     fn finds_no_pair_in_empty_counts() {
-        let counts = HashMap::new();
+        let counts = FxHashMap::default();
 
         let result = Tokenizer::find_most_frequent_pair(&counts);
 
@@ -578,7 +586,7 @@ mod tests {
 
     #[test]
     fn finds_pair_with_highest_frequency() {
-        let mut counts = HashMap::new();
+        let mut counts = FxHashMap::default();
         counts.insert((10, 20), 50);
         counts.insert((20, 30), 100);
         counts.insert((30, 40), 75);
@@ -590,7 +598,7 @@ mod tests {
 
     #[test]
     fn finds_smallest_pair_when_frequencies_are_equal() {
-        let mut counts = HashMap::new();
+        let mut counts = FxHashMap::default();
         counts.insert((u32::MAX, u32::MAX), usize::MAX);
         counts.insert((0, u32::MAX), usize::MAX);
         counts.insert((0, 0), usize::MAX);
@@ -658,7 +666,7 @@ mod tests {
     fn handles_empty_sequence() {
         let mut vec: Vec<u32> = vec![];
         Tokenizer::replace_pair_in_seq(&mut vec, 10, 20, 100);
-        assert_eq!(vec, vec![]);
+        assert_eq!(vec, Vec::<u32>::new());
     }
 
     #[test]
@@ -676,7 +684,7 @@ mod tests {
 
     #[test]
     fn trains_first_merge() {
-        let tokenizer = Tokenizer::train(["aaaa"], 257);
+        let tokenizer = Tokenizer::train("aaaa", 257);
 
         assert_eq!(tokenizer.vocab_size(), 257);
         assert_eq!(tokenizer.vocab[256], vec![b'a', b'a']);
@@ -687,7 +695,7 @@ mod tests {
 
     #[test]
     fn training_keeps_texts_separate() {
-        let tokenizer = Tokenizer::train(["ab", "cd"], 258);
+        let tokenizer = Tokenizer::train("ab\ncd", 258);
 
         assert_eq!(tokenizer.vocab_size(), 258);
         assert!(tokenizer.merges.contains_key(&(97, 98)));
@@ -696,14 +704,14 @@ mod tests {
 
     #[test]
     fn target_below_base_vocabulary_keeps_all_byte_tokens() {
-        let tokenizer = Tokenizer::train(["aaaa"], 100);
+        let tokenizer = Tokenizer::train("aaaa", 100);
 
         assert_eq!(tokenizer.vocab_size(), 256);
     }
 
     #[test]
     fn training_stops_when_no_pairs_remain() {
-        let tokenizer = Tokenizer::train(["a"], 300);
+        let tokenizer = Tokenizer::train("a", 300);
 
         assert_eq!(tokenizer.vocab_size(), 256);
         assert!(tokenizer.merges.is_empty());
@@ -711,7 +719,7 @@ mod tests {
 
     #[test]
     fn encodes_with_learned_merge() {
-        let tokenizer = Tokenizer::train(["aaaa"], 257);
+        let tokenizer = Tokenizer::train("aaaa", 257);
 
         assert_eq!(tokenizer.encode("aaaa"), vec![256, 256]);
         assert_eq!(tokenizer.decode(&[256, 256]).unwrap(), "aaaa");
@@ -719,7 +727,7 @@ mod tests {
 
     #[test]
     fn encodes_with_learned_merge2() {
-        let tokenizer = Tokenizer::train(["aaaaaaaa"], 258);
+        let tokenizer = Tokenizer::train("aaaaaaaa", 258);
 
         assert_eq!(tokenizer.encode("aaaaaaaa"), vec![257, 257]);
         assert_eq!(tokenizer.decode(&[257, 257]).unwrap(), "aaaaaaaa");
@@ -728,7 +736,7 @@ mod tests {
 
     #[test]
     fn trained_encode_then_decode_returns_original_text() {
-        let tokenizer = Tokenizer::train(["aaaaaaaa"], 258);
+        let tokenizer = Tokenizer::train("aaaaaaaa", 258);
         let text = "aaaaaaaa";
 
         assert_eq!(tokenizer.decode(&tokenizer.encode(text)).unwrap(), text);
@@ -740,7 +748,7 @@ mod tests {
             "bpe_tokenizer_round_trip_{}.json",
             std::process::id()
         ));
-        let tokenizer = Tokenizer::train(["banana banana", "bandana"], 270);
+        let tokenizer = Tokenizer::train("banana banana\nbandana", 270);
 
         tokenizer.save_to_file(&path).unwrap();
         let loaded = Tokenizer::load_from_file(&path).unwrap();
@@ -791,7 +799,7 @@ mod tests {
     fn load_rejects_invalid_merge_reference() {
         let path =
             std::env::temp_dir().join(format!("bpe_tokenizer_merge_{}.json", std::process::id()));
-        let tokenizer = Tokenizer::train(["aaaa"], 257);
+        let tokenizer = Tokenizer::train("aaaa", 257);
         tokenizer.save_to_file(&path).unwrap();
 
         let json = std::fs::read_to_string(&path).unwrap();
